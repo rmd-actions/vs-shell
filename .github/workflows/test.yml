@@ -2,12 +2,29 @@ name: Test
 
 on:
   push:
+    paths-ignore:
+      - '**.md'
   schedule:
     # Weekly, at 00:30 UTC on Friday (somewhat randomly chosen).
     - cron: '30 00 * * 5'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
+  lint:
+    name: Linting
+    runs-on: ubuntu-slim
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@v0.7.1
+
   test:
     strategy:
       fail-fast: false
@@ -19,7 +36,6 @@ jobs:
           - x86
           - Win32
           - x64
-
         include:
           # Prettier run names.
           - {os: windows-2022, name: Windows 2022 / VS 2022}
@@ -38,37 +54,35 @@ jobs:
           # The ARM images seem to be maintained here:
           # https://github.com/actions/partner-runner-images/tree/main/images
           - os: windows-11-arm
-            name: Windows 11 ARM / VS 2022
+            name: Windows 11 ARM / VS 2026
             arch: arm64
             expected_arch: arm64
-            condition: '$version -ge 1930 -and $version -lt 1950'
+            condition: '$version -ge 1950'
 
           - os: windows-11-arm
-            name: Windows 11 ARM / VS 2022
+            name: Windows 11 ARM / VS 2026
             arch: arm
             expected_arch: arm64
-            condition: '$version -ge 1930 -and $version -lt 1950'
-
-    runs-on: '${{ matrix.os }}'
-
-    name: '${{ matrix.name }} / ${{ matrix.arch }}'
-
+            condition: '$version -ge 1950'
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }} / ${{ matrix.arch }}
     defaults:
       run:
         shell: pwsh
-
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: cl.exe shouldn't be found
         run: |
           $(Get-Command cl -ErrorAction SilentlyContinue) -and $(throw "cl.exe was found!")
 
       - name: Set up Visual Studio shell
-        uses: ./
+        uses: $/
         with:
-          arch: '${{ matrix.arch }}'
+          arch: ${{ matrix.arch }}
 
       - name: cl.exe should be found now
         run: |
@@ -96,3 +110,19 @@ jobs:
           $actual = $env:VSCMD_ARG_TGT_ARCH
           $expected = '${{ matrix.expected_arch }}'
           $($expected -eq $actual) -or $(throw "Unexpected target architecture: $actual")
+
+  release:
+    if: github.ref_type == 'tag'
+    name: Release
+    runs-on: ubuntu-latest
+    needs:
+      - test
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Release
+        uses: softprops/action-gh-release@v3
