@@ -2,12 +2,29 @@ name: Test
 
 on:
   push:
+    paths-ignore:
+      - '**.md'
   schedule:
     # Weekly, at 00:30 UTC on Friday (somewhat randomly chosen).
     - cron: '30 00 * * 5'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
+  lint:
+    name: Linting
+    runs-on: ubuntu-slim
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@v0.8.1
+
   test:
     strategy:
       fail-fast: false
@@ -15,67 +32,101 @@ jobs:
         os:
           - windows-2022
           - windows-2025
+          - windows-11-arm
         arch:
           - x86
           - Win32
           - x64
-
+          - arm
+          - arm64
+        method:
+          - auto
+          - cmd
+          - ps
+        exclude:
+          # The x86 runners don't seem to include ARM cross-compilers, but the
+          # ARM runners do (as of Nov '26).
+          - {os: windows-2022, arch: arm}
+          - {os: windows-2022, arch: arm64}
+          - {os: windows-2025, arch: arm}
+          - {os: windows-2025, arch: arm64}
         include:
           # Prettier run names.
-          - {os: windows-2022, name: Windows 2022 / VS 2022}
-          - {os: windows-2025, name: Windows 2025 / VS 2026}
+          - {os: windows-2022,   name: Windows 2022 / VS 2022}
+          - {os: windows-2025,   name: Windows 2025 / VS 2026}
+          - {os: windows-11-arm, name: Windows 11 ARM / VS 2026}
+
+          - {method: auto, method_suffix: ''}
+          - {method: cmd,  method_suffix: ' / VsDevCmd.bat'}
+          - {method: ps,   method_suffix: ' / DevShell.dll'}
 
           # Scripting helpers.
           # Also, see: https://learn.microsoft.com/en-us/cpp/overview/compiler-versions?view=msvc-170
-          - {os: windows-2022, condition: '$version -ge 1930 -and $version -lt 1950'}
-          - {os: windows-2025, condition: '$version -ge 1950'}
+          - {os: windows-2022,   condition: '$version -ge 1930 -and $version -lt 1950'}
+          - {os: windows-2025,   condition: '$version -ge 1950'}
+          - {os: windows-11-arm, condition: '$version -ge 1950'}
+
+          # Expected in the output of cl /?
+          - {arch: x86,   cl_arch: x86}
+          - {arch: Win32, cl_arch: x86}
+          - {arch: x64,   cl_arch: x64}
+          - {arch: arm,   cl_arch: ARM64}
+          - {arch: arm64, cl_arch: ARM64}
 
           # Expected VSCMD_ARG_TGT_ARCH value.
-          - {arch: x86,   expected_arch: x86}
-          - {arch: Win32, expected_arch: x86}
-          - {arch: x64,   expected_arch: x64}
-
-          # The ARM images seem to be maintained here:
-          # https://github.com/actions/partner-runner-images/tree/main/images
-          - os: windows-11-arm
-            name: Windows 11 ARM / VS 2022
-            arch: arm64
-            expected_arch: arm64
-            condition: '$version -ge 1930 -and $version -lt 1950'
-
-          - os: windows-11-arm
-            name: Windows 11 ARM / VS 2022
-            arch: arm
-            expected_arch: arm64
-            condition: '$version -ge 1930 -and $version -lt 1950'
-
-    runs-on: '${{ matrix.os }}'
-
-    name: '${{ matrix.name }} / ${{ matrix.arch }}'
-
+          - {arch: x86,   vscmd_arch: x86}
+          - {arch: Win32, vscmd_arch: x86}
+          - {arch: x64,   vscmd_arch: x64}
+          - {arch: arm,   vscmd_arch: arm64}
+          - {arch: arm64, vscmd_arch: arm64}
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }} / ${{ matrix.arch }}${{ matrix.method_suffix }}
     defaults:
       run:
         shell: pwsh
-
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: cl.exe shouldn't be found
         run: |
           $(Get-Command cl -ErrorAction SilentlyContinue) -and $(throw "cl.exe was found!")
 
+      - name: Save $PSModulePath
+        id: orig_ps_module_path
+        run: |
+          $value = $env:PSModulePath
+          $value.Split(';') | %{ echo $_ }
+          echo "value=$value" >> $env:GITHUB_OUTPUT
+
       - name: Set up Visual Studio shell
-        uses: ./
+        uses: $/
         with:
-          arch: '${{ matrix.arch }}'
+          arch: ${{ matrix.arch }}
+          force_method: ${{ matrix.method }}
 
       - name: cl.exe should be found now
         run: |
-          $(Get-Command cl -ErrorAction SilentlyContinue) -or $(throw "cl.exe wasn't found!")
+          $path = Get-Command cl -ErrorAction SilentlyContinue
+          $path -or $(throw "cl.exe wasn't found!")
+          echo $path.Path
 
-      - name: cl.exe /? for debugging
-        run: cl /?
+      - name: Check cl.exe /?
+        run: |
+          $output = cl /? 2>&1 | % ToString | Select -First 2
+          echo $output
+          if (!$output[0].EndsWith(' for ${{ matrix.cl_arch }}')) {
+              throw "Unexpected target architecture"
+          }
+
+      - name: Verify environment variables
+        run: |
+          $actual = $env:VSCMD_ARG_TGT_ARCH
+          if ($actual -ne '${{ matrix.vscmd_arch }}') {
+              throw "Unexpected target architecture: $actual"
+          }
 
       - name: Check cl.exe version
         run: |
@@ -91,8 +142,49 @@ jobs:
           cl.exe /EHsc hello.cpp
           .\hello.exe
 
-      - name: Verify target architecture
+  keep_unrelated_vars:
+    runs-on: windows-latest
+    name: Check unrelated variables
+    # https://github.com/egor-tensin/vs-shell/pull/10
+    # The problem was that this action exported all of its new environment
+    # variables, and, being a pwsh action, it messed up with PSModulePath,
+    # among other things. If the calling workflow is PowerShell, it messes up
+    # the PowerShell stuff.
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Save $PSModulePath
+        id: orig_ps_module_path
         run: |
-          $actual = $env:VSCMD_ARG_TGT_ARCH
-          $expected = '${{ matrix.expected_arch }}'
-          $($expected -eq $actual) -or $(throw "Unexpected target architecture: $actual")
+          $value = $env:PSModulePath
+          $value.Split(';') | %{ echo $_ }
+          echo "value=$value" >> $env:GITHUB_OUTPUT
+      - name: Set up Visual Studio shell
+        uses: $/
+      - name: Check $PSModulePath
+        env:
+          ORIG_VALUE: ${{ steps.orig_ps_module_path.outputs.value }}
+        run: |
+          $value = $env:PSModulePath
+          $value.Split(';') | %{ echo $_ }
+          if ($value -ne $env:ORIG_VALUE) {
+              throw "%PSModulePath% was changed!"
+          }
+
+  release:
+    if: github.ref_type == 'tag'
+    name: Release
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - keep_unrelated_vars
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Release
+        uses: softprops/action-gh-release@v3
